@@ -7,16 +7,30 @@
         "data": {
           "plant_name": "Plant Name",
           "moisture_entity": "Soil Moisture Sensor (0–100 %)",
-          "light_entity": "Light Sensor (0–100 %)",
+          "light_entity": "Light Sensor (0–100 % or lux)",
           "temperature_entity": "Temperature Sensor (°C or °F, optional)",
           "humidity_entity": "Humidity Sensor (0–100 %, optional)"
         },
         "data_description": {
           "plant_name": "A friendly name for this plant, e.g. 'Monstera' or 'Kitchen Basil'",
           "moisture_entity": "Soil moisture reported as a percentage (0 = bone dry, 100 = saturated)",
-          "light_entity": "Ambient light reported as a percentage (0 = dark, 100 = full sun)",
+          "light_entity": "Ambient light as a percentage or in lux — the unit is detected automatically",
           "temperature_entity": "Ambient temperature — any unit, HA will convert automatically",
           "humidity_entity": "Relative humidity as a percentage"
+        }
+      },
+      "plantbook": {
+        "title": "Open PlantBook (optional)",
+        "description": "Connect to [Open PlantBook](https://open.plantbook.io) to pull species-specific care thresholds. Leave blank to use built-in generic defaults.\n\nCreate a free API account at https://open.plantbook.io/apikey/show/ to get your credentials.",
+        "data": {
+          "plantbook_client_id": "PlantBook Client ID",
+          "plantbook_client_secret": "PlantBook Client Secret",
+          "plant_species": "Plant Species / Common Name"
+        },
+        "data_description": {
+          "plantbook_client_id": "Client ID from your Open PlantBook API account",
+          "plantbook_client_secret": "Client Secret from your Open PlantBook API account",
+          "plant_species": "Scientific or common name used to look up this plant, e.g. 'monstera deliciosa' or 'peace lily'"
         }
       }
     },
@@ -34,11 +48,24 @@
       "init": {
         "title": "Update Plant Sensors",
         "data": {
-          "plant_name": "Plant Name",
           "moisture_entity": "Soil Moisture Sensor (0–100 %)",
-          "light_entity": "Light Sensor (0–100 %)",
+          "light_entity": "Light Sensor (0–100 % or lux)",
           "temperature_entity": "Temperature Sensor (optional)",
           "humidity_entity": "Humidity Sensor (optional)"
+        }
+      },
+      "plantbook": {
+        "title": "Open PlantBook (optional)",
+        "description": "Update your Open PlantBook credentials or species name. Leave blank to disable PlantBook for this plant.",
+        "data": {
+          "plantbook_client_id": "PlantBook Client ID",
+          "plantbook_client_secret": "PlantBook Client Secret",
+          "plant_species": "Plant Species / Common Name"
+        },
+        "data_description": {
+          "plantbook_client_id": "Client ID from your Open PlantBook API account",
+          "plantbook_client_secret": "Client Secret from your Open PlantBook API account",
+          "plant_species": "Scientific or common name used to look up this plant"
         }
       }
     }

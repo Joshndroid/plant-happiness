@@ -6,7 +6,25 @@ Entity state  : mood string — one of thriving / happy / okay / struggling /
                 need_water / dark / critical / unavailable
 Attributes    : happiness_score, per-sensor value + status label + color,
                 entity_id references so the Lovelace card can look up
-                last_changed timestamps.
+                last_changed timestamps, and (when PlantBook is configured)
+                species-specific min/max thresholds.
+
+Open PlantBook integration
+--------------------------
+If the config entry contains plantbook_client_id, plantbook_client_secret,
+and plant_species, the sensor fetches species data from Open PlantBook on
+startup.  The returned min/max ranges for soil moisture, temperature,
+humidity, and light are used to:
+
+  • Calibrate the bell-curve peak and width for each sensor, so happiness
+    scoring reflects what *this specific plant* actually needs rather than
+    generic defaults.
+  • Set the critical thresholds for the need_water and dark mood overrides.
+  • Expose all raw PlantBook values as extra attributes so the card (and
+    any automations) can reference the species limits directly.
+
+If PlantBook is not configured, or if the API call fails, the integration
+falls back to the built-in generic thresholds without any error state.
 """
 
 from __future__ import annotations
@@ -26,6 +44,8 @@ from homeassistant.const import UnitOfTemperature
 
 from .const import (
     ATTR_HAPPINESS_SCORE,
+    ATTR_HUMID_MAX,
+    ATTR_HUMID_MIN,
     ATTR_HUMIDITY,
     ATTR_HUMIDITY_COLOR,
     ATTR_HUMIDITY_ENTITY,
@@ -33,19 +53,31 @@ from .const import (
     ATTR_LIGHT,
     ATTR_LIGHT_COLOR,
     ATTR_LIGHT_ENTITY,
+    ATTR_LIGHT_LUX_MAX,
+    ATTR_LIGHT_LUX_MIN,
     ATTR_LIGHT_STATUS,
     ATTR_MOISTURE,
     ATTR_MOISTURE_COLOR,
     ATTR_MOISTURE_ENTITY,
     ATTR_MOISTURE_STATUS,
+    ATTR_PLANTBOOK_DISPLAY,
+    ATTR_PLANTBOOK_PID,
+    ATTR_PLANTBOOK_SYNCED,
+    ATTR_SOIL_MOIST_MAX,
+    ATTR_SOIL_MOIST_MIN,
     ATTR_TEMPERATURE,
     ATTR_TEMPERATURE_COLOR,
     ATTR_TEMPERATURE_ENTITY,
     ATTR_TEMPERATURE_STATUS,
+    ATTR_TEMP_MAX,
+    ATTR_TEMP_MIN,
     CONF_HUMIDITY_ENTITY,
     CONF_LIGHT_ENTITY,
     CONF_MOISTURE_ENTITY,
     CONF_PLANT_NAME,
+    CONF_PLANTBOOK_CLIENT_ID,
+    CONF_PLANTBOOK_CLIENT_SECRET,
+    CONF_PLANT_SPECIES,
     CONF_TEMPERATURE_ENTITY,
     DOMAIN,
     HUMIDITY_THRESHOLDS,
@@ -64,8 +96,15 @@ from .const import (
     WEIGHT_MOISTURE,
     WEIGHT_TEMPERATURE,
 )
+from .plantbook import PlantBookClient
 
 _LOGGER = logging.getLogger(__name__)
+
+# Units that indicate the light sensor reports in lux (not %)
+_LUX_UNITS = {"lux", "lx"}
+
+# Minimum bell-curve width to prevent overly sharp scoring curves
+_MIN_CURVE_WIDTH = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -105,34 +144,102 @@ def _get_threshold(value: float, thresholds: list[dict]) -> dict:
     return thresholds[-1]
 
 
+def _curve_from_range(
+    min_val: float | None,
+    max_val: float | None,
+    default_peak: float,
+    default_width: float,
+) -> tuple[float, float]:
+    """Derive (peak, width) from a PlantBook min/max pair.
+
+    If either bound is missing or the range is invalid, returns the
+    supplied defaults unchanged.
+    """
+    if min_val is not None and max_val is not None and max_val > min_val:
+        peak = (min_val + max_val) / 2.0
+        width = max((max_val - min_val) / 4.0, _MIN_CURVE_WIDTH)
+        return peak, width
+    return default_peak, default_width
+
+
+def _build_overrides(pb: dict[str, Any]) -> dict[str, tuple[float, float]]:
+    """Build a sensor→(peak, width) dict from PlantBook data.
+
+    Only keys that the PlantBook data can actually improve are included;
+    sensors with missing ranges keep their defaults via fallback logic in
+    _compute_happiness.
+    """
+    overrides: dict[str, tuple[float, float]] = {}
+
+    moisture_peak, moisture_width = _curve_from_range(
+        pb.get("soil_moist_min"), pb.get("soil_moist_max"),
+        55.0, 22.0,
+    )
+    # Only override if PlantBook data actually changed the defaults
+    if pb.get("soil_moist_min") is not None and pb.get("soil_moist_max") is not None:
+        overrides["moisture"] = (moisture_peak, moisture_width)
+
+    if pb.get("temp_min") is not None and pb.get("temp_max") is not None:
+        overrides["temperature"] = _curve_from_range(
+            pb.get("temp_min"), pb.get("temp_max"), 22.0, 7.0
+        )
+
+    if pb.get("env_humid_min") is not None and pb.get("env_humid_max") is not None:
+        overrides["humidity"] = _curve_from_range(
+            pb.get("env_humid_min"), pb.get("env_humid_max"), 50.0, 18.0
+        )
+
+    # Light (lux) — only applied when the HA sensor reports in lux; see sensor
+    if pb.get("light_lux_min") is not None and pb.get("light_lux_max") is not None:
+        overrides["light_lux"] = _curve_from_range(
+            pb.get("light_lux_min"), pb.get("light_lux_max"), None, None  # type: ignore[arg-type]
+        )
+
+    return overrides
+
+
 def _compute_happiness(
     moisture: float | None,
     light: float | None,
     temperature: float | None,
     humidity: float | None,
+    overrides: dict[str, tuple[float, float]] | None = None,
 ) -> int:
-    """Return a weighted happiness score 0–100 from available sensor values."""
+    """Return a weighted happiness score 0–100 from available sensor values.
 
-    sensor_map = {
-        "moisture": (moisture, WEIGHT_MOISTURE, 55.0, 22.0),
-        "light":    (light,    WEIGHT_LIGHT,    48.0, 25.0),
-        "temperature": (temperature, WEIGHT_TEMPERATURE, 22.0, 7.0),
-        "humidity": (humidity, WEIGHT_HUMIDITY, 50.0, 18.0),
+    *overrides* maps sensor name → (peak, width) and is used when
+    PlantBook data provides species-specific optimal ranges.
+    """
+    overrides = overrides or {}
+
+    # Default peaks and widths (generic, plant-agnostic)
+    defaults: dict[str, tuple[float, float]] = {
+        "moisture":    (55.0, 22.0),
+        "light":       (48.0, 25.0),
+        "temperature": (22.0,  7.0),
+        "humidity":    (50.0, 18.0),
+    }
+
+    sensor_map: dict[str, tuple[float | None, float]] = {
+        "moisture":    (moisture,    WEIGHT_MOISTURE),
+        "light":       (light,       WEIGHT_LIGHT),
+        "temperature": (temperature, WEIGHT_TEMPERATURE),
+        "humidity":    (humidity,    WEIGHT_HUMIDITY),
     }
 
     total_weight = 0.0
-    total_score = 0.0
+    total_score  = 0.0
 
-    for _name, (value, weight, peak, width) in sensor_map.items():
+    for name, (value, weight) in sensor_map.items():
         if value is not None:
+            peak, width = overrides.get(name, defaults[name])
             score = _bell_score(value, peak, width)
-            total_score += score * weight
+            total_score  += score * weight
             total_weight += weight
 
     if total_weight == 0:
         return 0
 
-    # Normalise so missing sensors don't deflate the result
     return round(total_score / total_weight)
 
 
@@ -140,8 +247,14 @@ def _mood_from_score(
     score: int,
     moisture: float | None,
     light: float | None,
+    moisture_critical: float = 25.0,
+    light_critical: float = 15.0,
 ) -> str:
-    """Derive mood string from happiness score and critical sensor extremes."""
+    """Derive mood string from happiness score and critical sensor extremes.
+
+    *moisture_critical* and *light_critical* can be overridden with
+    species-specific thresholds from PlantBook (e.g. soil_moist_min).
+    """
     if score >= 88:
         return MOOD_THRIVING
     if score >= 70:
@@ -150,9 +263,9 @@ def _mood_from_score(
         return MOOD_OKAY
 
     # Below 50 — let sensor extremes override to a specific face
-    if moisture is not None and moisture < 25:
+    if moisture is not None and moisture < moisture_critical:
         return MOOD_NEED_WATER
-    if light is not None and light < 15:
+    if light is not None and light < light_critical:
         return MOOD_DARK
     if score >= 30:
         return MOOD_STRUGGLING
@@ -171,7 +284,7 @@ def _celsius_value(state: State) -> float | None:
         return TemperatureConverter.convert(
             raw, UnitOfTemperature.FAHRENHEIT, UnitOfTemperature.CELSIUS
         )
-    return raw  # assume °C for anything else
+    return raw
 
 
 def _float_value(state: State) -> float | None:
@@ -182,18 +295,23 @@ def _float_value(state: State) -> float | None:
         return None
 
 
+def _unit(state: State) -> str:
+    """Return the lower-cased unit_of_measurement from a state, or ''."""
+    return (state.attributes.get("unit_of_measurement") or "").lower().strip()
+
+
 # ---------------------------------------------------------------------------
 # Entity
 # ---------------------------------------------------------------------------
 
 
 class PlantHappinessSensor(SensorEntity):
-    """A sensor entity that aggregates plant health into a single mood state.
+    """Aggregates plant health into a single mood state.
 
     State   : mood string (thriving / happy / okay / struggling /
               need_water / dark / critical / unavailable)
     Attributes : happiness_score, per-sensor value/status/color,
-                 entity_id references for timestamp lookups by the card.
+                 entity_id references, and optional PlantBook species data.
     """
 
     _attr_icon = "mdi:sprout"
@@ -206,7 +324,6 @@ class PlantHappinessSensor(SensorEntity):
         self._config: dict[str, Any] = {**entry.data, **entry.options}
 
         plant_name: str = self._config.get(CONF_PLANT_NAME, "Plant")
-        slug = plant_name.lower().replace(" ", "_")
 
         self._attr_unique_id = f"{DOMAIN}_{entry.entry_id}"
         self._attr_name = f"{plant_name} Happiness"
@@ -215,12 +332,40 @@ class PlantHappinessSensor(SensorEntity):
         self._extra_attrs: dict[str, Any] = {}
         self._unsub_listeners: list = []
 
+        # PlantBook species data — populated in async_added_to_hass
+        self._plantbook_data: dict[str, Any] | None = None
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def async_added_to_hass(self) -> None:
-        """Subscribe to state changes on all configured sensor entities."""
+        """Subscribe to sensor state changes and fetch PlantBook data."""
+
+        # Fetch Open PlantBook data if credentials are configured
+        client_id     = self._config.get(CONF_PLANTBOOK_CLIENT_ID, "").strip()
+        client_secret = self._config.get(CONF_PLANTBOOK_CLIENT_SECRET, "").strip()
+        species       = self._config.get(CONF_PLANT_SPECIES, "").strip()
+
+        if client_id and client_secret and species:
+            client = PlantBookClient(self.hass, client_id, client_secret)
+            self._plantbook_data = await client.async_get_plant_data(species)
+            if self._plantbook_data:
+                _LOGGER.info(
+                    "%s: PlantBook data loaded for '%s' (pid=%s)",
+                    self._config.get(CONF_PLANT_NAME),
+                    species,
+                    self._plantbook_data.get("pid"),
+                )
+            else:
+                _LOGGER.warning(
+                    "%s: PlantBook lookup for '%s' returned no data — "
+                    "falling back to generic thresholds",
+                    self._config.get(CONF_PLANT_NAME),
+                    species,
+                )
+
+        # Subscribe to HA sensor state changes
         entity_ids = [
             self._config.get(CONF_MOISTURE_ENTITY),
             self._config.get(CONF_LIGHT_ENTITY),
@@ -237,7 +382,7 @@ class PlantHappinessSensor(SensorEntity):
         self._unsub_listeners.append(
             async_track_state_change_event(self.hass, watch_ids, _state_changed)
         )
-        # Compute initial state
+
         self._update_state()
 
     async def async_will_remove_from_hass(self) -> None:
@@ -287,40 +432,98 @@ class PlantHappinessSensor(SensorEntity):
         if moisture_state is None or light_state is None:
             self._attr_native_value = "unavailable"
             self._extra_attrs = {
-                ATTR_MOISTURE_ENTITY: self._config.get(CONF_MOISTURE_ENTITY),
-                ATTR_LIGHT_ENTITY:    self._config.get(CONF_LIGHT_ENTITY),
+                ATTR_MOISTURE_ENTITY:    self._config.get(CONF_MOISTURE_ENTITY),
+                ATTR_LIGHT_ENTITY:       self._config.get(CONF_LIGHT_ENTITY),
                 ATTR_TEMPERATURE_ENTITY: self._config.get(CONF_TEMPERATURE_ENTITY),
                 ATTR_HUMIDITY_ENTITY:    self._config.get(CONF_HUMIDITY_ENTITY),
+                ATTR_PLANTBOOK_SYNCED:   self._plantbook_data is not None,
             }
             return
 
         # Parse values
         moisture    = _float_value(moisture_state)
-        light       = _float_value(light_state)
+        light_raw   = _float_value(light_state)
         temperature = _celsius_value(temp_state) if temp_state else None
         humidity    = _float_value(humid_state) if humid_state else None
 
-        if moisture is None or light is None:
+        if moisture is None or light_raw is None:
             self._attr_native_value = "unavailable"
             return
 
-        # Clamp percentages
+        # Determine light sensor unit so we know whether to apply lux curves
+        light_unit_str = _unit(light_state)
+        light_is_lux   = light_unit_str in _LUX_UNITS
+
+        # Clamp percentage values (lux is unbounded, leave as-is)
         moisture = max(0.0, min(100.0, moisture))
-        light    = max(0.0, min(100.0, light))
+        light    = light_raw if light_is_lux else max(0.0, min(100.0, light_raw))
         if humidity is not None:
             humidity = max(0.0, min(100.0, humidity))
 
+        # ------------------------------------------------------------------
+        # Build PlantBook-derived scoring overrides
+        # ------------------------------------------------------------------
+        pb = self._plantbook_data
+        overrides: dict[str, tuple[float, float]] = {}
+        moisture_critical = 25.0   # default need_water threshold
+        light_critical    = 15.0   # default dark threshold
+
+        if pb:
+            overrides = _build_overrides(pb)
+
+            # Apply lux curve to 'light' only when the sensor reports lux
+            if light_is_lux and "light_lux" in overrides:
+                overrides["light"] = overrides["light_lux"]
+
+            # Species-specific critical thresholds for mood override
+            if pb.get("soil_moist_min") is not None:
+                moisture_critical = float(pb["soil_moist_min"])
+            if light_is_lux and pb.get("light_lux_min") is not None:
+                light_critical = float(pb["light_lux_min"])
+
+        # ------------------------------------------------------------------
         # Score and mood
-        score = _compute_happiness(moisture, light, temperature, humidity)
-        mood  = _mood_from_score(score, moisture, light)
+        # ------------------------------------------------------------------
+        score = _compute_happiness(moisture, light, temperature, humidity, overrides)
+        mood  = _mood_from_score(score, moisture, light, moisture_critical, light_critical)
 
-        # Threshold lookups
+        # ------------------------------------------------------------------
+        # Threshold label/colour lookups (percentage-based sensors)
+        # ------------------------------------------------------------------
         m_thresh = _get_threshold(moisture, MOISTURE_THRESHOLDS)
-        l_thresh = _get_threshold(light,    LIGHT_THRESHOLDS)
-        t_thresh = _get_threshold(temperature, TEMPERATURE_THRESHOLDS) if temperature is not None else None
-        h_thresh = _get_threshold(humidity,    HUMIDITY_THRESHOLDS)    if humidity    is not None else None
+        t_thresh = (
+            _get_threshold(temperature, TEMPERATURE_THRESHOLDS)
+            if temperature is not None else None
+        )
+        h_thresh = (
+            _get_threshold(humidity, HUMIDITY_THRESHOLDS)
+            if humidity is not None else None
+        )
 
+        # Light label — use lux-aware thresholds if sensor reports lux and
+        # PlantBook gave us a lux range; otherwise fall back to % thresholds.
+        if light_is_lux and pb and pb.get("light_lux_max"):
+            lux_max = float(pb["light_lux_max"])
+            lux_min = float(pb.get("light_lux_min") or 0)
+            lux_range = lux_max - lux_min if lux_max > lux_min else lux_max
+            # Derive a simple label from relative position in the species range
+            if light < lux_min * 0.5:
+                l_status, l_color = "Too Dark", "#555555"
+            elif light < lux_min:
+                l_status, l_color = "Below Ideal", "#e3b341"
+            elif light <= lux_max:
+                l_status, l_color = "Ideal Light", "#7dff9a"
+            elif light <= lux_max * 1.5:
+                l_status, l_color = "Bright", "#58a6ff"
+            else:
+                l_status, l_color = "Very Bright", "#ff9a4a"
+        else:
+            l_thresh = _get_threshold(light, LIGHT_THRESHOLDS)
+            l_status, l_color = l_thresh["status"], l_thresh["color"]
+
+        # ------------------------------------------------------------------
         # Build attributes
+        # ------------------------------------------------------------------
         attrs: dict[str, Any] = {
             ATTR_HAPPINESS_SCORE: score,
             # Moisture
@@ -329,8 +532,8 @@ class PlantHappinessSensor(SensorEntity):
             ATTR_MOISTURE_COLOR:  m_thresh["color"],
             # Light
             ATTR_LIGHT:           round(light, 1),
-            ATTR_LIGHT_STATUS:    l_thresh["status"],
-            ATTR_LIGHT_COLOR:     l_thresh["color"],
+            ATTR_LIGHT_STATUS:    l_status,
+            ATTR_LIGHT_COLOR:     l_color,
             # Entity IDs (for last_changed lookups in the card)
             ATTR_MOISTURE_ENTITY:     self._config.get(CONF_MOISTURE_ENTITY),
             ATTR_LIGHT_ENTITY:        self._config.get(CONF_LIGHT_ENTITY),
@@ -349,13 +552,38 @@ class PlantHappinessSensor(SensorEntity):
             attrs[ATTR_HUMIDITY_STATUS] = h_thresh["status"]
             attrs[ATTR_HUMIDITY_COLOR]  = h_thresh["color"]
 
+        # PlantBook species data
+        if pb:
+            attrs.update(
+                {
+                    ATTR_PLANTBOOK_SYNCED:  True,
+                    ATTR_PLANTBOOK_PID:     pb.get("pid"),
+                    ATTR_PLANTBOOK_DISPLAY: pb.get("display_pid"),
+                    ATTR_SOIL_MOIST_MIN:    pb.get("soil_moist_min"),
+                    ATTR_SOIL_MOIST_MAX:    pb.get("soil_moist_max"),
+                    ATTR_TEMP_MIN:          pb.get("temp_min"),
+                    ATTR_TEMP_MAX:          pb.get("temp_max"),
+                    ATTR_HUMID_MIN:         pb.get("env_humid_min"),
+                    ATTR_HUMID_MAX:         pb.get("env_humid_max"),
+                    ATTR_LIGHT_LUX_MIN:     pb.get("light_lux_min"),
+                    ATTR_LIGHT_LUX_MAX:     pb.get("light_lux_max"),
+                }
+            )
+        else:
+            attrs[ATTR_PLANTBOOK_SYNCED] = False
+
         self._attr_native_value = mood
         self._extra_attrs = attrs
 
         _LOGGER.debug(
-            "%s → mood=%s score=%d moisture=%.1f light=%.1f temp=%s humid=%s",
+            "%s → mood=%s score=%d moisture=%.1f light=%.1f%s temp=%s humid=%s pb=%s",
             self._config.get(CONF_PLANT_NAME),
-            mood, score, moisture, light,
+            mood,
+            score,
+            moisture,
+            light,
+            " lux" if light_is_lux else "%",
             f"{temperature:.1f}" if temperature is not None else "n/a",
             f"{humidity:.1f}"    if humidity    is not None else "n/a",
+            pb.get("display_pid") if pb else "none",
         )
