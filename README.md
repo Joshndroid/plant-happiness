@@ -20,7 +20,7 @@ Instead of a simple OK/problem state, this integration computes a **happiness sc
 ## Installation via HACS
 
 1. In HACS → Integrations → ⋮ → Custom repositories
-2. Add: `https://github.com/your-username/plant-happiness-integration` — Category: **Integration**
+2. Add: `https://github.com/Joshndroid/plant-happiness` — Category: **Integration**
 3. Click **Plant Happiness** → Install
 4. Restart Home Assistant
 5. Settings → Integrations → Add Integration → search **Plant Happiness**
@@ -129,4 +129,4 @@ The created sensor (`sensor.<name>_happiness`) exposes:
 
 ## Related
 
-- [Plant Happiness Card](https://github.com/your-username/plant-happiness-card) — the Lovelace card that displays this integration's data
+- [Plant Happiness Card](https://github.com/Joshndroid/plant-happiness-card) — the Lovelace card that displays this integration's data
