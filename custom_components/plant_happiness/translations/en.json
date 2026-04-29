@@ -1,0 +1,46 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Add a Plant",
+        "description": "Configure a plant to monitor. Moisture and light are required; temperature and humidity are optional but improve happiness scoring.",
+        "data": {
+          "plant_name": "Plant Name",
+          "moisture_entity": "Soil Moisture Sensor (0–100 %)",
+          "light_entity": "Light Sensor (0–100 %)",
+          "temperature_entity": "Temperature Sensor (°C or °F, optional)",
+          "humidity_entity": "Humidity Sensor (0–100 %, optional)"
+        },
+        "data_description": {
+          "plant_name": "A friendly name for this plant, e.g. 'Monstera' or 'Kitchen Basil'",
+          "moisture_entity": "Soil moisture reported as a percentage (0 = bone dry, 100 = saturated)",
+          "light_entity": "Ambient light reported as a percentage (0 = dark, 100 = full sun)",
+          "temperature_entity": "Ambient temperature — any unit, HA will convert automatically",
+          "humidity_entity": "Relative humidity as a percentage"
+        }
+      }
+    },
+    "error": {
+      "moisture_required": "A soil moisture sensor is required.",
+      "light_required": "A light sensor is required.",
+      "invalid_entity": "One or more selected entities could not be found."
+    },
+    "abort": {
+      "already_configured": "A plant with this name is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Update Plant Sensors",
+        "data": {
+          "plant_name": "Plant Name",
+          "moisture_entity": "Soil Moisture Sensor (0–100 %)",
+          "light_entity": "Light Sensor (0–100 %)",
+          "temperature_entity": "Temperature Sensor (optional)",
+          "humidity_entity": "Humidity Sensor (optional)"
+        }
+      }
+    }
+  }
+}
